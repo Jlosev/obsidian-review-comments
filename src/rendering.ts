@@ -18,7 +18,6 @@ import { COMMENT_THREAD_REGEX } from "./constants";
 import {
   CommentThread,
   ParsedMeta,
-  REPLY_TAG,
   buildReplyThread,
   buildThreadWithNewBody,
   formatDate,

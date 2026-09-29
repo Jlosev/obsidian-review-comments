@@ -1,4 +1,4 @@
-import { App, Modal } from "obsidian";
+import { Modal } from "obsidian";
 import { attachDictationButton } from "./dictation";
 import type ReviewCommentsPlugin from "./main";
 import { I18n } from "./i18n";

@@ -783,7 +783,7 @@ export function detectObsidianLocale(): Locale {
     const fromApi = getLanguage();
     if (fromApi) candidates.push(fromApi);
   } catch {
-    // getLanguage は 1.8.0 で入ったため、それ未満では次の候補に回す
+    // getLanguage は 1.8.7 で入ったため、それ未満では次の候補に回す
   }
   if (typeof navigator !== "undefined" && navigator.language) {
     candidates.push(navigator.language);

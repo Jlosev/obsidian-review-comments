@@ -11,6 +11,23 @@ import type ReviewCommentsPlugin from "./main";
 /** 文字起こしの多くが受け取れる形に揃える。16kHz のモノラル */
 const SAMPLE_RATE = 16000;
 
+/**
+ * 録音の取り出し口。旧来の取り出し方は仕様から外れているため
+ * AudioWorklet を使う。外部ファイルを置けないので、その場で組んで読ませる
+ */
+const RECORDER_WORKLET = `
+class RecorderProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const channel = inputs[0] && inputs[0][0];
+    if (channel && channel.length > 0) {
+      this.port.postMessage(new Float32Array(channel));
+    }
+    return true;
+  }
+}
+registerProcessor("review-comment-recorder", RecorderProcessor);
+`;
+
 /** Float32 の並びを 16bit の WAV にする */
 function toWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
   const buffer = new ArrayBuffer(44 + samples.length * 2);
@@ -45,7 +62,8 @@ function toWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
 class DictationSession {
   private stream: MediaStream | null = null;
   private context: AudioContext | null = null;
-  private processor: ScriptProcessorNode | null = null;
+  private node: AudioWorkletNode | null = null;
+  private workletUrl: string | null = null;
   private frames: Float32Array[] = [];
   private recording = false;
 
@@ -84,15 +102,25 @@ class DictationSession {
     this.frames = [];
     // 文字起こしの入口は WAV を前提にしているものが多い。MediaRecorder が返す
     // webm ではなく、生の標本を集めて自分で WAV に組む
-    this.context = new AudioContext({ sampleRate: SAMPLE_RATE });
-    const source = this.context.createMediaStreamSource(this.stream);
-    this.processor = this.context.createScriptProcessor(4096, 1, 1);
-    this.processor.addEventListener("audioprocess", (e) => {
-      if (!this.recording) return;
-      this.frames.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-    });
-    source.connect(this.processor);
-    this.processor.connect(this.context.destination);
+    const context = new AudioContext({ sampleRate: SAMPLE_RATE });
+    this.context = context;
+
+    const blob = new Blob([RECORDER_WORKLET], { type: "text/javascript" });
+    this.workletUrl = URL.createObjectURL(blob);
+    try {
+      await context.audioWorklet.addModule(this.workletUrl);
+    } catch {
+      this.teardown();
+      new Notice(i18n.t("notice.dictationNoMic"));
+      return;
+    }
+
+    const node = new AudioWorkletNode(context, "review-comment-recorder");
+    node.port.onmessage = (e: MessageEvent<Float32Array>) => {
+      if (this.recording) this.frames.push(e.data);
+    };
+    context.createMediaStreamSource(this.stream).connect(node);
+    this.node = node;
 
     this.recording = true;
     this.setButtonState("recording");
@@ -142,8 +170,13 @@ class DictationSession {
   }
 
   private teardown() {
-    this.processor?.disconnect();
-    this.processor = null;
+    this.node?.port.close();
+    this.node?.disconnect();
+    this.node = null;
+    if (this.workletUrl) {
+      URL.revokeObjectURL(this.workletUrl);
+      this.workletUrl = null;
+    }
     void this.context?.close();
     this.context = null;
     this.stream?.getTracks().forEach((track) => track.stop());
@@ -254,8 +287,13 @@ async function transcribe(
   if (response.status >= 400) {
     throw new Error(`${response.status} ${response.text.slice(0, 200)}`);
   }
-  const text = (response.json?.text ?? "") as string;
-  return text.trim();
+  // 戻りの形は宛先ごとに違う。text が文字列のときだけ使う
+  const payload: unknown = response.json;
+  const text =
+    payload && typeof payload === "object" && "text" in payload
+      ? (payload as { text: unknown }).text
+      : undefined;
+  return typeof text === "string" ? text.trim() : "";
 }
 
 /**

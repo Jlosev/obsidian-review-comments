@@ -175,9 +175,6 @@ classDiagram
 
     class ReviewCommentsSettingTab {
         +ReviewCommentsPlugin plugin
-        +getSettingDefinitions() SettingDefinitionItem[]
-        +setControlValue(String key, unknown value) Promise
-        -buildCommentTypesDesc() DocumentFragment
         +display() void
     }
 

@@ -57,7 +57,7 @@ function toRecord(
 export async function scanVault(
   plugin: ReviewCommentsPlugin
 ): Promise<ScanResult> {
-  const { app, settings } = plugin;
+  const { app } = plugin;
   const records: CommentRecord[] = [];
   let fileCount = 0;
 
@@ -95,6 +95,13 @@ export function isOwnOutput(
     path.startsWith(`${notes}/`) ||
     path.startsWith(`${resolved}/`)
   );
+}
+
+/** コメントノートが指している元のノート。読めないときは null */
+function sourceOf(app: App, file: TFile): string | null {
+  const frontmatter = app.metadataCache.getFileCache(file)?.frontmatter;
+  const source: unknown = frontmatter ? frontmatter.source : undefined;
+  return typeof source === "string" ? source : null;
 }
 
 function yamlString(value: string): string {
@@ -178,7 +185,7 @@ export async function syncCommentNotes(
       if (!(child instanceof TFile)) continue;
       if (child.extension !== "md") continue;
       if (written.has(child.path)) continue;
-      await app.vault.trash(child, true);
+      await app.fileManager.trashFile(child);
     }
   }
 
@@ -279,10 +286,9 @@ export async function syncOneFile(
   for (const child of dir.children) {
     if (!(child instanceof TFile)) continue;
     if (child.extension !== "md") continue;
-    const source = app.metadataCache.getFileCache(child)?.frontmatter?.source;
-    if (source !== file.path) continue;
+    if (sourceOf(app, child) !== file.path) continue;
     if (kept.has(child.basename)) continue;
-    await app.vault.trash(child, true);
+    await app.fileManager.trashFile(child);
   }
 }
 
@@ -303,8 +309,7 @@ export async function dropNotesFor(
   for (const child of dir.children) {
     if (!(child instanceof TFile)) continue;
     if (child.extension !== "md") continue;
-    const source = app.metadataCache.getFileCache(child)?.frontmatter?.source;
-    if (source !== sourcePath) continue;
-    await app.vault.trash(child, true);
+    if (sourceOf(app, child) !== sourcePath) continue;
+    await app.fileManager.trashFile(child);
   }
 }
