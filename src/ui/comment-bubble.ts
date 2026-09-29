@@ -15,7 +15,7 @@ export async function renderIntoInlineContext(
   sourcePath: string,
   component: Component
 ) {
-  const tmp = target.ownerDocument.createElement("div");
+  const tmp = createDiv();
   await MarkdownRenderer.render(app, markdown, tmp, sourcePath, component);
   if (tmp.children.length === 1 && tmp.firstElementChild?.tagName === "P") {
     const p = tmp.firstElementChild;
@@ -23,20 +23,46 @@ export async function renderIntoInlineContext(
   } else {
     while (tmp.firstChild) target.appendChild(tmp.firstChild);
   }
+  markHeadingAnchor(target);
+}
+
+const HEADING_TAGS = ["H1", "H2", "H3", "H4", "H5", "H6"];
+
+/**
+ * 中身が見出しのときだけ、外側のアンカーへクラスを付ける。CSS の :has で
+ * 同じことをすると、無関係な変更でも広い範囲の再判定が走る
+ */
+function markHeadingAnchor(target: HTMLElement) {
+  const anchor = target.parentElement;
+  if (!anchor) return;
+  const isHeading = Array.from(target.children).some((child) =>
+    HEADING_TAGS.includes(child.tagName)
+  );
+  anchor.toggleClass("review-comment-has-heading", isHeading);
+}
+
+export interface CommentBubbleHandlers {
+  // 記法を外してハイライトされていたテキストだけを残す
+  onDelete?: () => void;
+  // 1件目の本文を書き換える
+  onEdit?: () => void;
+  // スレッドの末尾へ返信を足す
+  onReply?: () => void;
 }
 
 /**
  * 吹き出しボタンと、クリックで開閉するポップオーバーを container へ足す。
- * onEdit を渡すと右上に編集ボタン、onDelete を渡すと削除ボタンが付く。削除は
- * 記法を外してハイライトされていたテキストだけを残す。
+ * entries の1件目がコメント、2件目以降が返信。返信が無いときの見た目は
+ * 1件だけを渡していたときと同じになる。
  */
 export function appendCommentBubble(
   container: HTMLElement,
-  meta: ParsedMeta,
+  entries: ParsedMeta[],
   i18n: I18n,
-  onDelete?: () => void,
-  onEdit?: () => void
+  handlers: CommentBubbleHandlers = {}
 ) {
+  const meta = entries[0];
+  const { onDelete, onEdit, onReply } = handlers;
   container.addClass("review-comment-anchor");
   container.dataset.type = meta.type;
 
@@ -45,6 +71,13 @@ export function appendCommentBubble(
     attr: { type: "button", "aria-label": i18n.t("bubble.show") },
   });
   setIcon(btn, TYPE_LUCIDE[meta.type] || "message-circle");
+  // 返信が付いているスレッドは件数を出す。1件だけのときは今までどおり出さない
+  if (entries.length > 1) {
+    btn.createSpan({
+      cls: "review-comment-bubble-count",
+      text: String(entries.length),
+    });
+  }
 
   const popover = container.createDiv({ cls: "review-comment-bubble-popover" });
 
@@ -65,6 +98,26 @@ export function appendCommentBubble(
         e.stopPropagation();
         closeAllCommentPopovers(container.ownerDocument);
         onEdit();
+      });
+    }
+
+    if (onReply) {
+      const replyBtn = actions.createEl("button", {
+        cls: "review-comment-bubble-popover-btn",
+        attr: { type: "button", "aria-label": i18n.t("bubble.reply") },
+      });
+      setIcon(replyBtn, "reply");
+      // Obsidian が同梱するアイコンに reply が無い版では空の四角になる。
+      // 何も入らなかったときだけ文字で出す
+      if (!replyBtn.firstElementChild) {
+        replyBtn.setText(i18n.t("panel.reply"));
+      }
+      replyBtn.addEventListener("mousedown", (e) => e.preventDefault());
+      replyBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        closeAllCommentPopovers(container.ownerDocument);
+        onReply();
       });
     }
 
@@ -104,6 +157,18 @@ export function appendCommentBubble(
   const body = popover.createDiv({ cls: "review-comment-bubble-popover-body" });
   body.setText(meta.body);
 
+  for (const reply of entries.slice(1)) {
+    const item = popover.createDiv({
+      cls: "review-comment-bubble-popover-reply",
+    });
+    item
+      .createDiv({ cls: "review-comment-bubble-popover-header" })
+      .setText(`${reply.author} · ${reply.date}`);
+    item
+      .createDiv({ cls: "review-comment-bubble-popover-body" })
+      .setText(reply.body);
+  }
+
   btn.addEventListener("mousedown", (e) => e.preventDefault());
   btn.addEventListener("click", (e) => {
     e.preventDefault();
@@ -114,7 +179,7 @@ export function appendCommentBubble(
   });
 }
 
-export function closeAllCommentPopovers(doc: Document = activeDocument) {
+export function closeAllCommentPopovers(doc: Document) {
   doc
     .querySelectorAll(".review-comment-bubble-popover.is-open")
     .forEach((el) => el.removeClass("is-open"));

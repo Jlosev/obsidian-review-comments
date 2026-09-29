@@ -23,11 +23,14 @@ flowchart TD
         M4 -->|Iterate| M5["addCommand(add-comment-{id})"]
         M5 --> M4
         M4 -->|Done| M6["add open panel command + ribbon icon"]
-        M6 --> M7["registerView + registerEditorExtension + registerMarkdownPostProcessor"]
-        M7 --> M8["FloatingBar.mount()"]
-        M8 --> M9(["Plugin Ready"])
+        M6 --> M6b["add sync/export commands"]
+        M6b --> M6c["vault on modify / rename -> debounce -> syncOneFile() when autoSync"]
+        M6c --> M7["registerView + registerEditorExtension + registerMarkdownPostProcessor"]
+        M7 --> M8["onLayoutReady -> mountFloatingBars() (1 bar per window)"]
+        M8 --> M8b["workspace on window-open / window-close -> add/remove bar"]
+        M8b --> M9(["Plugin Ready"])
 
-        U1(["onunload()"]) --> U3["FloatingBar.destroy()"]
+        U1(["onunload()"]) --> U3["child components unload -> each FloatingBar.onunload()"]
         U3 --> U4(["Plugin Unloaded"])
     end
 
@@ -69,7 +72,7 @@ flowchart TD
         R1b -->|Yes| R1c["Replace block with review-comment-block + bubble"]
         R1b -->|No| R2{"Text node contains {== ?"}
         R2 -->|No| R3["Skip node"]
-        R2 -->|Yes| R4{"while COMMENT_REGEX matches"}
+        R2 -->|Yes| R4{"for each thread from parseThreads()"}
         R4 -->|Match| R5["parseMeta(m[2]) + render highlighted markdown + appendCommentBubble"]
         R5 --> R4
         R4 -->|Done| R6["replace text node with fragment"]
@@ -83,7 +86,7 @@ flowchart TD
 
         V1(["CommentsView.renderComments()"]) --> V2{"MarkdownView available?"}
         V2 -->|No| V3["Render open-markdown message"]
-        V2 -->|Yes| V4{"while COMMENT_REGEX matches editor text"}
+        V2 -->|Yes| V4{"for each thread from parseThreads(editor text)"}
         V4 -->|Match| V5["Collect match: highlighted/meta/offset/full"]
         V5 --> V4
         V4 -->|Done| V6{"matches.length === 0?"}
@@ -118,7 +121,7 @@ classDiagram
     class ReviewCommentsPlugin {
         +ReviewCommentsSettings settings
         +I18n i18n
-        -FloatingBar floatingBar
+        -Map~Window, FloatingBar~ floatingBars
         +onload() Promise
         +onunload() void
         +loadSettings() Promise
@@ -130,12 +133,15 @@ classDiagram
 
     class FloatingBar {
         -ReviewCommentsPlugin plugin
+        -Window win
+        -Document doc
         -HTMLDivElement el
         -number selectionDebounce
-        +mount() void
+        +onload() void
         +refreshLabels() void
-        +destroy() void
+        +onunload() void
         -renderButtons() void
+        -activeViewInThisWindow() MarkdownView
         -enterComposing() void
         -clearCompositionEndGrace() void
         -update() void
@@ -169,6 +175,9 @@ classDiagram
 
     class ReviewCommentsSettingTab {
         +ReviewCommentsPlugin plugin
+        +getSettingDefinitions() SettingDefinitionItem[]
+        +setControlValue(String key, unknown value) Promise
+        -buildCommentTypesDesc() DocumentFragment
         +display() void
     }
 
@@ -221,7 +230,7 @@ classDiagram
 
     class Constants {
         <<service>>
-        +RegExp COMMENT_REGEX
+        +RegExp COMMENT_THREAD_REGEX
         +String VIEW_TYPE_COMMENTS
         +CommentType TYPES
         +Record TYPE_ICON
@@ -241,10 +250,27 @@ classDiagram
         +ignoreEvent() boolean
     }
 
+    class Dictation {
+        <<service>>
+        +attachDictationButton(HTMLElement container, HTMLTextAreaElement textarea, ReviewCommentsPlugin plugin) Function
+        -toWav(Float32Array samples, number sampleRate) ArrayBuffer
+        -transcribe(ReviewCommentsPlugin plugin, ArrayBuffer wav) Promise~String~
+    }
+
+    class Store {
+        <<service>>
+        +scanVault(ReviewCommentsPlugin plugin) Promise~ScanResult~
+        +syncCommentNotes(ReviewCommentsPlugin plugin) Promise~number~
+        +exportComments(ReviewCommentsPlugin plugin) Promise
+        +appendResolved(ReviewCommentsPlugin plugin, String sourcePath, CommentThread thread) Promise~String~
+        +syncOneFile(ReviewCommentsPlugin plugin, TFile file) Promise
+        +isOwnOutput(ReviewCommentsPlugin plugin, String path) boolean
+    }
+
     class CommentBubble {
         <<service>>
         +renderIntoInlineContext(App app, String markdown, HTMLElement target, String sourcePath, Component component) Promise
-        +appendCommentBubble(HTMLElement container, ParsedMeta meta, I18n i18n, Function onDelete) void
+        +appendCommentBubble(HTMLElement container, ParsedMeta meta, I18n i18n, Function onDelete, Function onEdit) void
         +closeAllCommentPopovers(Document doc) void
     }
 
@@ -260,7 +286,7 @@ classDiagram
     CommentsView --|> ItemView
     ReviewCommentsSettingTab --|> PluginSettingTab
 
-    ReviewCommentsPlugin "1" --* "1" FloatingBar : owns
+    ReviewCommentsPlugin "1" --* "0..*" FloatingBar : owns one per window
     ReviewCommentsPlugin "1" --* "1" I18n : owns
     ReviewCommentsPlugin ..> CommentInputModal : creates
     ReviewCommentsPlugin ..> CommentFormat : uses
@@ -269,6 +295,12 @@ classDiagram
 
     FloatingBar --> ReviewCommentsPlugin : calls
     FloatingBar ..> Constants : reads TYPES
+    FloatingBar ..> CommentBubble : closes popovers in its own document
+    Store ..> CommentFormat : uses parseThreads
+    CommentsView ..> Store : appendResolved on resolve
+    ReviewCommentsPlugin ..> Store : sync / export commands
+    CommentInputModal ..> Dictation : microphone button
+    CommentsView ..> Dictation : microphone button
 
     CommentsView --> ReviewCommentsPlugin : depends on
     CommentsView ..> CommentFormat : uses parseMeta

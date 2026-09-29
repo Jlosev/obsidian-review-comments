@@ -1,4 +1,6 @@
 import { App, Modal } from "obsidian";
+import { attachDictationButton } from "./dictation";
+import type ReviewCommentsPlugin from "./main";
 import { I18n } from "./i18n";
 
 export interface CommentInputModalOptions {
@@ -11,19 +13,27 @@ export class CommentInputModal extends Modal {
   private readonly typeLabel: string;
   private readonly onSubmit: (body: string) => void;
   private readonly options: CommentInputModalOptions;
+  private readonly plugin: ReviewCommentsPlugin;
+  private stopDictation: (() => void) | null = null;
 
   constructor(
-    app: App,
-    i18n: I18n,
+    plugin: ReviewCommentsPlugin,
     typeLabel: string,
     onSubmit: (body: string) => void,
     options: CommentInputModalOptions = {}
   ) {
-    super(app);
-    this.i18n = i18n;
+    super(plugin.app);
+    this.plugin = plugin;
+    this.i18n = plugin.i18n;
     this.typeLabel = typeLabel;
     this.onSubmit = onSubmit;
     this.options = options;
+  }
+
+  onClose() {
+    // 開いたまま閉じられたときにマイクを掴んだままにしない
+    this.stopDictation?.();
+    this.stopDictation = null;
   }
 
   onOpen() {
@@ -53,6 +63,7 @@ export class CommentInputModal extends Modal {
     const actions = contentEl.createDiv({
       cls: "review-comment-modal-actions",
     });
+    this.stopDictation = attachDictationButton(actions, textarea, this.plugin);
     const cancelBtn = actions.createEl("button", {
       text: this.i18n.t("modal.cancel"),
       cls: "mod-muted",
@@ -71,7 +82,7 @@ export class CommentInputModal extends Modal {
       }
     });
 
-    window.setTimeout(() => {
+    contentEl.win.setTimeout(() => {
       textarea.focus();
       textarea.setSelectionRange(textarea.value.length, textarea.value.length);
     }, 0);

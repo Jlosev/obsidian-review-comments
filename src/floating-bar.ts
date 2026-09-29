@@ -1,63 +1,96 @@
-import { MarkdownView } from "obsidian";
+import { Component, MarkdownView } from "obsidian";
 import type ReviewCommentsPlugin from "./main";
 import { TYPES } from "./constants";
+import { closeAllCommentPopovers } from "./ui/comment-bubble";
 
 /** compositionend のあと、compositionstart が再発火しないか待つ時間 */
 const COMPOSITION_END_GRACE_MS = 150;
 
-export class FloatingBar {
+/**
+ * 選択範囲の上に出すボタンの列。1つのウィンドウに1本だけ持つ。
+ *
+ * ポップアウトウィンドウは自分の document と window を持ち、selectionchange も
+ * getSelection もそちら側にしか無い。メインウィンドウで1本だけ作ると、増やした
+ * ウィンドウにはボタンの列が出ない。ウィンドウの開閉に合わせて main 側が本体を
+ * 足し引きする。
+ */
+export class FloatingBar extends Component {
   private readonly plugin: ReviewCommentsPlugin;
+  private readonly win: Window;
+  private readonly doc: Document;
   private el: HTMLDivElement | null = null;
   private selectionDebounce: number | null = null;
   // 日本語入力の変換中は true。変換候補の下線が選択として拾われるのを避ける
   private isComposing = false;
   private compositionEndGrace: number | null = null;
 
-  constructor(plugin: ReviewCommentsPlugin) {
+  constructor(plugin: ReviewCommentsPlugin, win: Window) {
+    super();
     this.plugin = plugin;
+    this.win = win;
+    this.doc = win.document;
   }
 
-  mount() {
-    const doc = activeDocument;
-    const bar = doc.body.createDiv({
+  onload() {
+    const bar = this.doc.body.createDiv({
       cls: "review-comment-floating-bar is-hidden",
     });
     this.el = bar;
     this.renderButtons();
 
-    this.plugin.registerDomEvent(doc, "selectionchange", () => {
+    this.registerDomEvent(this.doc, "selectionchange", () => {
       if (this.isComposing) return;
       if (this.selectionDebounce !== null) {
-        window.clearTimeout(this.selectionDebounce);
+        this.win.clearTimeout(this.selectionDebounce);
       }
-      this.selectionDebounce = window.setTimeout(() => this.update(), 80);
+      this.selectionDebounce = this.win.setTimeout(() => this.update(), 80);
     });
 
     // 変換中は候補の文字列が選択として見えてバーがちらつく。変換の間は隠す。
     // スペースキーで候補を送るときは compositionend の直後に compositionstart が
     // 再発火するため、compositionend は少し待ってから反映する
-    this.plugin.registerDomEvent(doc, "compositionstart", () =>
+    this.registerDomEvent(this.doc, "compositionstart", () =>
       this.enterComposing()
     );
-    this.plugin.registerDomEvent(doc, "compositionupdate", () =>
+    this.registerDomEvent(this.doc, "compositionupdate", () =>
       this.enterComposing()
     );
-    this.plugin.registerDomEvent(doc, "compositionend", () => {
+    this.registerDomEvent(this.doc, "compositionend", () => {
       this.clearCompositionEndGrace();
-      this.compositionEndGrace = window.setTimeout(() => {
+      this.compositionEndGrace = this.win.setTimeout(() => {
         this.compositionEndGrace = null;
         this.isComposing = false;
         this.update();
       }, COMPOSITION_END_GRACE_MS);
     });
 
-    this.plugin.registerDomEvent(window, "scroll", () => this.hide(), {
+    this.registerDomEvent(this.win, "scroll", () => this.hide(), {
       capture: true,
     });
 
-    this.plugin.registerDomEvent(doc, "keydown", (e: KeyboardEvent) => {
+    this.registerDomEvent(this.doc, "keydown", (e: KeyboardEvent) => {
       if (e.key === "Escape") this.hide();
     });
+
+    // 吹き出しは開いたウィンドウの document にしか無いため、閉じる判定もウィンドウ
+    // ごとに要る。コメントのアンカーの外を押したときだけ閉じる
+    this.registerDomEvent(this.doc, "click", (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target || !target.closest(".review-comment-anchor")) {
+        closeAllCommentPopovers(this.doc);
+      }
+    });
+  }
+
+  onunload() {
+    // 予約済みの再描画が unload 後に走らないようにする
+    if (this.selectionDebounce !== null) {
+      this.win.clearTimeout(this.selectionDebounce);
+      this.selectionDebounce = null;
+    }
+    this.clearCompositionEndGrace();
+    this.el?.remove();
+    this.el = null;
   }
 
   // 言語を切り替えたときに呼ぶ。ボタンは一度作ると i18n の変更が届かない
@@ -83,8 +116,7 @@ export class FloatingBar {
       btn.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        const mdView =
-          this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+        const mdView = this.activeViewInThisWindow();
         this.hide();
         if (mdView && mdView.editor.getSelection()) {
           this.plugin.addCommentToSelection(mdView.editor, t.tag);
@@ -93,15 +125,14 @@ export class FloatingBar {
     }
   }
 
-  destroy() {
-    // 予約済みの再描画が unload 後に走らないようにする
-    if (this.selectionDebounce !== null) {
-      window.clearTimeout(this.selectionDebounce);
-      this.selectionDebounce = null;
-    }
-    this.clearCompositionEndGrace();
-    this.el?.remove();
-    this.el = null;
+  /**
+   * このウィンドウで開いている編集面。フォーカスが別のウィンドウへ移ったあとに
+   * 残っていたバーが反応すると、選択が無い側にボタンの列が出る
+   */
+  private activeViewInThisWindow(): MarkdownView | null {
+    const mdView = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!mdView) return null;
+    return mdView.containerEl.ownerDocument === this.doc ? mdView : null;
   }
 
   private enterComposing() {
@@ -112,7 +143,7 @@ export class FloatingBar {
 
   private clearCompositionEndGrace() {
     if (this.compositionEndGrace === null) return;
-    window.clearTimeout(this.compositionEndGrace);
+    this.win.clearTimeout(this.compositionEndGrace);
     this.compositionEndGrace = null;
   }
 
@@ -124,7 +155,7 @@ export class FloatingBar {
       return;
     }
 
-    const mdView = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+    const mdView = this.activeViewInThisWindow();
     if (!mdView) {
       this.hide();
       return;
@@ -136,7 +167,7 @@ export class FloatingBar {
       return;
     }
 
-    const sel = window.getSelection();
+    const sel = this.win.getSelection();
     if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
       this.hide();
       return;
@@ -157,8 +188,8 @@ export class FloatingBar {
     let left = rect.left;
     let top = rect.top - barHeight - 8;
 
-    if (left + barWidth > window.innerWidth - 8) {
-      left = window.innerWidth - barWidth - 8;
+    if (left + barWidth > this.win.innerWidth - 8) {
+      left = this.win.innerWidth - barWidth - 8;
     }
     if (left < 8) left = 8;
     if (top < 8) {

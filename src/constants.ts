@@ -9,7 +9,12 @@ export interface CommentType {
   lucide: string;
 }
 
-export const COMMENT_REGEX = /\{==([\s\S]+?)==\}\{>>([\s\S]+?)<<\}/g;
+
+/**
+ * ハイライトと、隙間なく続く `{>>...<<}` の全体。2つ目以降が返信になる
+ */
+export const COMMENT_THREAD_REGEX =
+  /\{==([\s\S]+?)==\}((?:\{>>[\s\S]*?<<\})+)/g;
 export const VIEW_TYPE_COMMENTS = "review-comments-view";
 
 export const TYPES: CommentType[] = [

@@ -1,8 +1,30 @@
+import { COMMENT_THREAD_REGEX } from "./constants";
+
 export interface ParsedMeta {
+  // 記法に識別子が書かれていないときは null。旧形式のノートで起きる
+  id: string | null;
   author: string;
   date: string;
   type: string;
   body: string;
+}
+
+/** 返信を表す種別。吹き出しバーの選択肢には出さず、返信のときだけ使う */
+export const REPLY_TAG = "REPLY";
+
+/** 識別子の形。`|` を含まないため既存の区切りと衝突しない */
+export const COMMENT_ID_PATTERN = /^rc-[0-9a-z]{6}$/;
+
+/**
+ * コメント1件に振る識別子。返信を同じコメントへ束ねる鍵で、記法の1つ目の
+ * 区切りに置く。読み上げずに目で追える長さに収める
+ */
+export function newCommentId(): string {
+  let suffix = "";
+  for (let i = 0; i < 6; i++) {
+    suffix += Math.floor(Math.random() * 36).toString(36);
+  }
+  return `rc-${suffix}`;
 }
 
 /**
@@ -35,9 +57,15 @@ export function unescapeMultiline(text: string): string {
 }
 
 export function parseMeta(meta: string): ParsedMeta {
-  const newFmt = meta.match(/^([^|]+)\|([^|]+)\|([A-Z]+):\s*([\s\S]*)$/);
+  // 識別子は先頭に置く。書かれていない記法は識別子を振る前に作られたもの
+  const idHead = meta.match(/^(rc-[0-9a-z]{6})\|([\s\S]*)$/);
+  const id = idHead ? idHead[1] : null;
+  const rest = idHead ? idHead[2] : meta;
+
+  const newFmt = rest.match(/^([^|]+)\|([^|]+)\|([A-Z]+):\s*([\s\S]*)$/);
   if (newFmt) {
     return {
+      id,
       author: newFmt[1].trim(),
       date: newFmt[2].trim(),
       type: newFmt[3].trim(),
@@ -45,9 +73,10 @@ export function parseMeta(meta: string): ParsedMeta {
     };
   }
 
-  const oldFmt = meta.match(/^([^|]+)\|([^|:]+):\s*([\s\S]*)$/);
+  const oldFmt = rest.match(/^([^|]+)\|([^|:]+):\s*([\s\S]*)$/);
   if (oldFmt) {
     return {
+      id,
       author: oldFmt[1].trim(),
       date: oldFmt[2].trim(),
       type: "NOTE",
@@ -55,7 +84,13 @@ export function parseMeta(meta: string): ParsedMeta {
     };
   }
 
-  return { author: "", date: "", type: "NOTE", body: unescapeMultiline(meta) };
+  return {
+    id,
+    author: "",
+    date: "",
+    type: "NOTE",
+    body: unescapeMultiline(rest),
+  };
 }
 
 export function sanitizeAuthor(name: string): string {
@@ -100,7 +135,150 @@ export function buildCommentMarkup(
   preparedBody: string,
   fallback: { author: string; date: string }
 ): string {
+  return `{==${rawHighlighted}==}${buildMetaBlock(
+    meta,
+    preparedBody,
+    fallback
+  )}`;
+}
+
+/** `{>>...<<}` の1つ分。識別子を持つ記法だけ先頭に識別子を出す */
+export function buildMetaBlock(
+  meta: ParsedMeta,
+  preparedBody: string,
+  fallback: { author: string; date: string }
+): string {
   const author = meta.author || fallback.author;
   const date = meta.date || fallback.date;
-  return `{==${rawHighlighted}==}{>>${author}|${date}|${meta.type}: ${preparedBody}<<}`;
+  const head = meta.id ? `${meta.id}|` : "";
+  return `{>>${head}${author}|${date}|${meta.type}: ${preparedBody}<<}`;
+}
+
+/**
+ * ハイライトと、それに続く `{>>...<<}` を並べて1つの記法にする。1件目が
+ * コメント、2件目以降が返信になる
+ */
+export function buildThreadMarkup(
+  rawHighlighted: string,
+  metaBlocks: string[]
+): string {
+  return `{==${rawHighlighted}==}${metaBlocks.join("")}`;
+}
+
+/**
+ * 連なった `{>>...<<}` を1つずつに割る。中身は `<<}` を含まないため、
+ * 区切りの取り違えは起きない
+ */
+export function splitMetaBlocks(raw: string): string[] {
+  const blocks: string[] = [];
+  const regex = /\{>>([\s\S]*?)<<\}/g;
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(raw))) {
+    blocks.push(m[1]);
+  }
+  return blocks;
+}
+
+/**
+ * ハイライトと、それに続く記法をひとまとまりとして扱う形。1件目がコメント、
+ * 2件目以降が返信になる。返信の無い記法は entries が1件だけになり、
+ * 識別子を振る前に書かれた記法でもそのまま読める
+ */
+export interface CommentThread {
+  // 画面に出す形。改行はエスケープを解いてある
+  highlighted: string;
+  // ノートに書かれているままの形。記法を組み直すときはこちらを使う
+  rawHighlighted: string;
+  entries: ParsedMeta[];
+  // 各 `{>>...<<}` の中身。位置で組み直すときに使う
+  rawMetaBlocks: string[];
+  // 記法全体
+  full: string;
+  // 走査した文字列の先頭からの位置
+  offset: number;
+}
+
+/** 記法を読む唯一の入口。編集中、読み取りモード、パネルの3か所が共有する */
+export function parseThreads(text: string): CommentThread[] {
+  const regex = new RegExp(COMMENT_THREAD_REGEX);
+  const threads: CommentThread[] = [];
+  let m: RegExpExecArray | null;
+
+  while ((m = regex.exec(text))) {
+    const rawMetaBlocks = splitMetaBlocks(m[2]);
+    if (rawMetaBlocks.length === 0) continue;
+    threads.push({
+      highlighted: unescapeMultiline(m[1]),
+      rawHighlighted: m[1],
+      entries: rawMetaBlocks.map(parseMeta),
+      rawMetaBlocks,
+      full: m[0],
+      offset: m.index,
+    });
+  }
+
+  return threads;
+}
+
+/** スレッドの識別子。1件目に書かれているものを使う */
+export function threadId(thread: CommentThread): string | null {
+  return thread.entries[0]?.id ?? null;
+}
+
+/** スレッドを記法へ戻す。本文はすべてエスケープ済みで渡す */
+export function buildThreadFromEntries(
+  rawHighlighted: string,
+  entries: ParsedMeta[],
+  preparedBodies: string[],
+  fallback: { author: string; date: string }
+): string {
+  const blocks = entries.map((entry, i) =>
+    buildMetaBlock(entry, preparedBodies[i], fallback)
+  );
+  return buildThreadMarkup(rawHighlighted, blocks);
+}
+
+/**
+ * スレッドの末尾へ返信を足した記法を作る。識別子を持たない記法には、この時点で
+ * 識別子を振る。返信を付けるまで古い記法をそのまま置いておける
+ */
+export function buildReplyThread(
+  rawHighlighted: string,
+  entries: ParsedMeta[],
+  preparedReplyBody: string,
+  fallback: { author: string; date: string }
+): string {
+  const id = entries[0]?.id ?? newCommentId();
+  const blocks = entries.map((entry) =>
+    buildMetaBlock({ ...entry, id }, escapeMultiline(entry.body), fallback)
+  );
+  blocks.push(
+    buildMetaBlock(
+      {
+        id,
+        author: fallback.author,
+        date: fallback.date,
+        type: REPLY_TAG,
+        body: "",
+      },
+      preparedReplyBody,
+      fallback
+    )
+  );
+  return buildThreadMarkup(rawHighlighted, blocks);
+}
+
+/**
+ * 1件目の本文だけ差し替えた記法を作る。返信はそのまま残す
+ */
+export function buildThreadWithNewBody(
+  rawHighlighted: string,
+  entries: ParsedMeta[],
+  preparedBody: string,
+  fallback: { author: string; date: string }
+): string {
+  const blocks = entries.map((entry, i) =>
+    buildMetaBlock(entry, i === 0 ? preparedBody : escapeMultiline(entry.body), fallback)
+  );
+  return buildThreadMarkup(rawHighlighted, blocks);
 }

@@ -1,10 +1,8 @@
 import {
-  App,
   Component,
   MarkdownPostProcessorContext,
   MarkdownRenderChild,
   Notice,
-  TFile,
   editorInfoField,
 } from "obsidian";
 import {
@@ -16,15 +14,17 @@ import {
   WidgetType,
 } from "@codemirror/view";
 import { RangeSetBuilder } from "@codemirror/state";
-import { COMMENT_REGEX } from "./constants";
+import { COMMENT_THREAD_REGEX } from "./constants";
 import {
+  CommentThread,
   ParsedMeta,
-  buildCommentMarkup,
+  REPLY_TAG,
+  buildReplyThread,
+  buildThreadWithNewBody,
   formatDate,
-  parseMeta,
+  parseThreads,
   prepareCommentBody,
   sanitizeAuthor,
-  unescapeMultiline,
 } from "./comment-format";
 import { TYPES } from "./constants";
 import { CommentInputModal } from "./modal";
@@ -42,7 +42,7 @@ class CommentWidget extends WidgetType {
   constructor(
     private readonly highlighted: string,
     private readonly rawHighlighted: string,
-    private readonly meta: ParsedMeta,
+    private readonly entries: ParsedMeta[],
     private readonly plugin: ReviewCommentsPlugin,
     private readonly sourcePath: string,
     private readonly range: { from: number; to: number },
@@ -60,16 +60,22 @@ class CommentWidget extends WidgetType {
       other.sourcePath === this.sourcePath &&
       other.range.from === this.range.from &&
       other.range.to === this.range.to &&
-      other.meta.type === this.meta.type &&
-      other.meta.author === this.meta.author &&
-      other.meta.date === this.meta.date &&
-      other.meta.body === this.meta.body
+      other.entries.length === this.entries.length &&
+      other.entries.every((e, i) => {
+        const mine = this.entries[i];
+        return (
+          e.id === mine.id &&
+          e.type === mine.type &&
+          e.author === mine.author &&
+          e.date === mine.date &&
+          e.body === mine.body
+        );
+      })
     );
   }
 
   toDOM(view: EditorView): HTMLElement {
-    const wrapper = activeDocument.createElement("span");
-    wrapper.className = "review-comment-widget";
+    const wrapper = createSpan({ cls: "review-comment-widget" });
     if (this.pulse) {
       wrapper.addClass("review-comment-widget-pulse");
     }
@@ -88,36 +94,36 @@ class CommentWidget extends WidgetType {
       this.renderComponent
     );
 
-    appendCommentBubble(
-      wrapper,
-      this.meta,
-      this.plugin.i18n,
-      () => {
-        view.dispatch({
-          changes: {
-            from: this.range.from,
-            to: this.range.to,
-            insert: this.highlighted,
-          },
-        });
-      },
-      () => {
-        openCommentEditModal(this.plugin, this.meta, (preparedBody) => {
-          view.dispatch({
-            changes: {
-              from: this.range.from,
-              to: this.range.to,
-              insert: buildCommentMarkup(
-                this.rawHighlighted,
-                this.meta,
-                preparedBody,
-                fallbackMeta(this.plugin)
-              ),
-            },
-          });
-        });
-      }
-    );
+    const replaceRange = (insert: string) =>
+      view.dispatch({
+        changes: { from: this.range.from, to: this.range.to, insert },
+      });
+
+    appendCommentBubble(wrapper, this.entries, this.plugin.i18n, {
+      onDelete: () => replaceRange(this.highlighted),
+      onEdit: () =>
+        openCommentEditModal(this.plugin, this.entries[0], (preparedBody) =>
+          replaceRange(
+            buildThreadWithNewBody(
+              this.rawHighlighted,
+              this.entries,
+              preparedBody,
+              fallbackMeta(this.plugin)
+            )
+          )
+        ),
+      onReply: () =>
+        openReplyModal(this.plugin, (preparedBody) =>
+          replaceRange(
+            buildReplyThread(
+              this.rawHighlighted,
+              this.entries,
+              preparedBody,
+              fallbackMeta(this.plugin)
+            )
+          )
+        ),
+    });
     return wrapper;
   }
 
@@ -137,12 +143,19 @@ export function createCommentDecorationExtension(
   return ViewPlugin.fromClass(
     class {
       decorations: DecorationSet;
+      // 記法の解析結果。本文が変わったときだけ作り直す。カーソルを動かすたびに
+      // 全文を文字列化して正規表現を当てると、大きいノートで打鍵ごとに効く
+      private threads: CommentThread[];
 
       constructor(view: EditorView) {
+        this.threads = parseThreads(view.state.doc.toString());
         this.decorations = this.buildDecorations(view);
       }
 
       update(update: ViewUpdate) {
+        if (update.docChanged) {
+          this.threads = parseThreads(update.state.doc.toString());
+        }
         if (
           update.docChanged ||
           update.viewportChanged ||
@@ -154,27 +167,25 @@ export function createCommentDecorationExtension(
 
       buildDecorations(view: EditorView): DecorationSet {
         const builder = new RangeSetBuilder<Decoration>();
-        const text = view.state.doc.toString();
-        const regex = new RegExp(COMMENT_REGEX);
-        let m: RegExpExecArray | null;
         const ranges = view.state.selection.ranges;
         const info = view.state.field(editorInfoField, false);
         const sourcePath = info?.file?.path ?? "";
 
-        while ((m = regex.exec(text))) {
-          const start = m.index;
-          const end = start + m[0].length;
+        for (const thread of this.threads) {
+          const start = thread.offset;
+          const end = start + thread.full.length;
           // カーソルか選択がコメントの内側へ入っているときだけ生の記法を出す。
           // 境界に接しているだけなら吹き出しのままにする
           const cursorInside = ranges.some((r) => r.from < end && r.to > start);
           // 挿入時に改行はエスケープされるので通常は来ないが、外で手書きされた
           // 記法への保険。Decoration.replace は改行をまたぐ範囲を置き換えられない
-          const spansMultipleLines = m[0].includes("\n");
+          const spansMultipleLines = thread.full.includes("\n");
 
           if (cursorInside || spansMultipleLines) {
             const highlightTextStart = start + 3;
-            const highlightTextEnd = highlightTextStart + m[1].length;
-            // "==}" の3文字を渡してから {>>...<<} を薄字にする
+            const highlightTextEnd =
+              highlightTextStart + thread.rawHighlighted.length;
+            // "==}" の3文字を渡してから、続く記法すべてを薄字にする
             const metaStart = highlightTextEnd + 3;
 
             builder.add(
@@ -188,7 +199,6 @@ export function createCommentDecorationExtension(
               Decoration.mark({ class: "review-comment-meta-live" })
             );
           } else {
-            const meta = parseMeta(m[2]);
             const isPulseTarget = plugin.pendingPulseOffset === start;
             if (isPulseTarget) {
               plugin.pendingPulseOffset = null;
@@ -198,9 +208,9 @@ export function createCommentDecorationExtension(
               end,
               Decoration.replace({
                 widget: new CommentWidget(
-                  unescapeMultiline(m[1]),
-                  m[1],
-                  meta,
+                  thread.highlighted,
+                  thread.rawHighlighted,
+                  thread.entries,
                   plugin,
                   sourcePath,
                   { from: start, to: end },
@@ -234,20 +244,19 @@ export async function renderCommentsInReadingMode(
 
   // ブロック全体がちょうど1つのコメントの場合。見出し行を丸ごと囲んだときに、
   // 通常の構文解析の外側でも見出しとして描くためハイライト部分を再描画する
-  const wholeBlockRegex = new RegExp(`^${COMMENT_REGEX.source}$`);
+  const wholeBlockRegex = new RegExp(`^${COMMENT_THREAD_REGEX.source}$`);
   const blockCandidates = Array.from(
     el.querySelectorAll("p, li, td, th, blockquote")
   ).filter((elm) => elm.children.length === 0);
 
   for (const blockEl of blockCandidates) {
-    const m = (blockEl.textContent || "").match(wholeBlockRegex);
-    if (!m) continue;
+    const blockText = blockEl.textContent || "";
+    if (!wholeBlockRegex.test(blockText)) continue;
+    const thread = parseThreads(blockText)[0];
+    if (!thread) continue;
 
-    const meta = parseMeta(m[2]);
-    const highlighted = unescapeMultiline(m[1]);
-    const fullMatch = m[0];
-    const replaced = doc.createElement("div");
-    replaced.className = "review-comment-block";
+    const { entries, highlighted, rawHighlighted, full: fullMatch } = thread;
+    const replaced = createDiv({ cls: "review-comment-block" });
 
     const content = replaced.createDiv({
       cls: "review-comment-block-content",
@@ -262,33 +271,43 @@ export async function renderCommentsInReadingMode(
       )
     );
 
-    const rawHighlighted = m[1];
-    appendCommentBubble(
-      replaced,
-      meta,
-      plugin.i18n,
-      () =>
-        void deleteCommentInFile(
-          plugin.app,
+    appendCommentBubble(replaced, entries, plugin.i18n, {
+      onDelete: () =>
+        void replaceCommentInFile(
+          plugin,
           ctx.sourcePath,
           fullMatch,
           highlighted
         ),
-      () =>
-        openCommentEditModal(plugin, meta, (preparedBody) =>
+      onEdit: () =>
+        openCommentEditModal(plugin, entries[0], (preparedBody) =>
           void replaceCommentInFile(
-            plugin.app,
+            plugin,
             ctx.sourcePath,
             fullMatch,
-            buildCommentMarkup(
+            buildThreadWithNewBody(
               rawHighlighted,
-              meta,
+              entries,
               preparedBody,
               fallbackMeta(plugin)
             )
           )
-        )
-    );
+        ),
+      onReply: () =>
+        openReplyModal(plugin, (preparedBody) =>
+          void replaceCommentInFile(
+            plugin,
+            ctx.sourcePath,
+            fullMatch,
+            buildReplyThread(
+              rawHighlighted,
+              entries,
+              preparedBody,
+              fallbackMeta(plugin)
+            )
+          )
+        ),
+    });
     blockEl.replaceWith(replaced);
   }
 
@@ -304,23 +323,25 @@ export async function renderCommentsInReadingMode(
     const text = tn.textContent || "";
     if (text.indexOf("{==") === -1) continue;
 
-    const regex = new RegExp(COMMENT_REGEX);
-    let m: RegExpExecArray | null;
     let lastIndex = 0;
-    const frag = doc.createDocumentFragment();
+    const frag = createFragment();
     let matched = false;
 
-    while ((m = regex.exec(text))) {
+    for (const thread of parseThreads(text)) {
       matched = true;
-      if (m.index > lastIndex) {
-        frag.appendChild(doc.createTextNode(text.slice(lastIndex, m.index)));
+      if (thread.offset > lastIndex) {
+        frag.appendChild(
+          doc.createTextNode(text.slice(lastIndex, thread.offset))
+        );
       }
 
-      const meta = parseMeta(m[2]);
-      const fullMatch = m[0];
-      const highlighted = unescapeMultiline(m[1]);
-      const span = doc.createElement("span");
-      span.className = "review-comment-highlight";
+      const {
+        entries,
+        highlighted,
+        rawHighlighted,
+        full: fullMatch,
+      } = thread;
+      const span = createSpan({ cls: "review-comment-highlight" });
 
       const content = span.createSpan({
         cls: "review-comment-highlight-content",
@@ -335,35 +356,45 @@ export async function renderCommentsInReadingMode(
         )
       );
 
-      const rawHighlighted = m[1];
-      appendCommentBubble(
-        span,
-        meta,
-        plugin.i18n,
-        () =>
-          void deleteCommentInFile(
-            plugin.app,
+      appendCommentBubble(span, entries, plugin.i18n, {
+        onDelete: () =>
+          void replaceCommentInFile(
+            plugin,
             ctx.sourcePath,
             fullMatch,
             highlighted
           ),
-        () =>
-          openCommentEditModal(plugin, meta, (preparedBody) =>
+        onEdit: () =>
+          openCommentEditModal(plugin, entries[0], (preparedBody) =>
             void replaceCommentInFile(
-              plugin.app,
+              plugin,
               ctx.sourcePath,
               fullMatch,
-              buildCommentMarkup(
+              buildThreadWithNewBody(
                 rawHighlighted,
-                meta,
+                entries,
                 preparedBody,
                 fallbackMeta(plugin)
               )
             )
-          )
-      );
+          ),
+        onReply: () =>
+          openReplyModal(plugin, (preparedBody) =>
+            void replaceCommentInFile(
+              plugin,
+              ctx.sourcePath,
+              fullMatch,
+              buildReplyThread(
+                rawHighlighted,
+                entries,
+                preparedBody,
+                fallbackMeta(plugin)
+              )
+            )
+          ),
+      });
       frag.appendChild(span);
-      lastIndex = m.index + m[0].length;
+      lastIndex = thread.offset + fullMatch.length;
     }
 
     if (!matched) continue;
@@ -394,8 +425,7 @@ function openCommentEditModal(
     TYPES.find((t) => t.tag === meta.type)?.labelKey ?? "type.note"
   );
   new CommentInputModal(
-    plugin.app,
-    plugin.i18n,
+    plugin,
     typeLabel,
     (body) => {
       const prepared = prepareCommentBody(body);
@@ -413,31 +443,58 @@ function openCommentEditModal(
 }
 
 /**
- * 読み取りモードの削除。post processor には編集中の Editor が渡らないため、
- * Vault.process でファイルを読み込みから保存まで一続きに書き換える。
+ * 返信の本文を受け取るモーダルを開く。新規コメントと同じ入力欄を使い、
+ * 見出しだけ返信の語に差し替える
  */
-async function deleteCommentInFile(
-  app: App,
-  sourcePath: string,
-  fullMatch: string,
-  highlighted: string
+function openReplyModal(
+  plugin: ReviewCommentsPlugin,
+  onSave: (preparedBody: string) => void
 ) {
-  await replaceCommentInFile(app, sourcePath, fullMatch, highlighted);
+  new CommentInputModal(
+    plugin,
+    plugin.i18n.t("type.reply"),
+    (body) => {
+      const prepared = prepareCommentBody(body);
+      if (!prepared.body) {
+        new Notice(plugin.i18n.t("notice.emptyCommentBody"));
+        return;
+      }
+      onSave(prepared.body);
+      if (prepared.adjusted) {
+        new Notice(plugin.i18n.t("notice.commentBodyAdjusted"));
+      }
+    }
+  ).open();
 }
 
-// 記法を別の文字列へ差し替える。読み取りモードから書き込む唯一の経路
+/**
+ * 読み取りモードから書き込む唯一の経路。post processor には編集中の Editor が
+ * 渡らないため、Vault.process でファイルを読み込みから保存まで一続きに扱う
+ */
 async function replaceCommentInFile(
-  app: App,
+  plugin: ReviewCommentsPlugin,
   sourcePath: string,
   fullMatch: string,
   replacement: string
 ) {
-  const file = app.vault.getAbstractFileByPath(sourcePath);
-  if (!(file instanceof TFile)) return;
-  await app.vault.process(file, (data) => {
+  const file = plugin.app.vault.getFileByPath(sourcePath);
+  if (!file) return;
+
+  let ambiguous = false;
+  await plugin.app.vault.process(file, (data) => {
     const at = data.indexOf(fullMatch);
     if (at === -1) return data;
+    // 同じ記法が2つあると、押した吹き出しと違う方を書き換える。識別子が付いた
+    // 記法なら重ならないが、識別子の無い古い記法では起こりうる
+    if (data.indexOf(fullMatch, at + fullMatch.length) !== -1) {
+      ambiguous = true;
+      return data;
+    }
     // 位置で切り貼りする。String.replace は置換側の $& を置換指定として扱う
     return data.slice(0, at) + replacement + data.slice(at + fullMatch.length);
   });
+
+  if (ambiguous) {
+    new Notice(plugin.i18n.t("notice.ambiguousComment"));
+  }
 }

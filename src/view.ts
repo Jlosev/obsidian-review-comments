@@ -6,27 +6,19 @@ import {
   WorkspaceLeaf,
 } from "obsidian";
 import type ReviewCommentsPlugin from "./main";
-import { COMMENT_REGEX, TYPE_ICON, VIEW_TYPE_COMMENTS } from "./constants";
+import { TYPE_ICON, VIEW_TYPE_COMMENTS } from "./constants";
 import {
-  ParsedMeta,
-  buildCommentMarkup,
+  CommentThread,
+  buildReplyThread,
+  buildThreadWithNewBody,
   formatDate,
-  parseMeta,
+  parseThreads,
   prepareCommentBody,
   sanitizeAuthor,
-  unescapeMultiline,
 } from "./comment-format";
-
-interface CommentMatch {
-  // 画面に出す形。改行はエスケープを解いてある
-  highlighted: string;
-  // ノートに書かれているままの形。記法を組み直すときはこちらを使う
-  rawHighlighted: string;
-  meta: ParsedMeta;
-  rawMeta: string;
-  offset: number;
-  full: string;
-}
+import { CommentInputModal } from "./modal";
+import { attachDictationButton } from "./dictation";
+import { appendResolved } from "./store";
 
 // 打鍵ごとに全文を読み直すと大きなノートで重くなるため、少し待ってから描画する
 const RENDER_DELAY_MS = 150;
@@ -85,14 +77,14 @@ export class CommentsView extends ItemView {
 
   private clearScheduledRender() {
     if (this.renderDebounce !== null) {
-      window.clearTimeout(this.renderDebounce);
+      this.containerEl.win.clearTimeout(this.renderDebounce);
       this.renderDebounce = null;
     }
   }
 
   private scheduleRender() {
     this.clearScheduledRender();
-    this.renderDebounce = window.setTimeout(() => {
+    this.renderDebounce = this.containerEl.win.setTimeout(() => {
       this.renderDebounce = null;
       this.renderComments();
     }, RENDER_DELAY_MS);
@@ -130,16 +122,63 @@ export class CommentsView extends ItemView {
     editor.focus();
   }
 
-  resolveComment(mdView: MarkdownView, match: CommentMatch) {
+  async resolveComment(mdView: MarkdownView, match: CommentThread) {
     const editor = mdView.editor;
     const startPos = editor.offsetToPos(match.offset);
     const endPos = editor.offsetToPos(match.offset + match.full.length);
+    // 再描画は待ち時間を挟むため、押した時点の位置が古くなっていることがある
+    if (editor.getRange(startPos, endPos) !== match.full) {
+      new Notice(this.plugin.i18n.t("notice.noteChangedDuringEdit"));
+      this.renderComments();
+      return;
+    }
+
+    const sourcePath = mdView.file?.path ?? "";
+    const path = await appendResolved(this.plugin, sourcePath, match);
     // 位置で置き換える。同じ本文のコメントが2つあると文字列検索では別の方が消える
     editor.replaceRange(match.highlighted, startPos, endPos);
+    new Notice(this.plugin.i18n.t("notice.resolvedArchived", { path }));
     this.renderComments();
   }
 
-  renderEditForm(card: HTMLElement, mdView: MarkdownView, match: CommentMatch) {
+  /** スレッドの末尾へ返信を足す。識別子の無い記法にはここで識別子を振る */
+  replyToComment(mdView: MarkdownView, match: CommentThread) {
+    new CommentInputModal(
+      this.plugin,
+      this.plugin.i18n.t("type.reply"),
+      (body) => {
+        const prepared = prepareCommentBody(body);
+        if (!prepared.body) {
+          new Notice(this.plugin.i18n.t("notice.emptyCommentBody"));
+          return;
+        }
+
+        const editor = mdView.editor;
+        const startPos = editor.offsetToPos(match.offset);
+        const endPos = editor.offsetToPos(match.offset + match.full.length);
+        if (editor.getRange(startPos, endPos) !== match.full) {
+          new Notice(this.plugin.i18n.t("notice.noteChangedDuringEdit"));
+          this.renderComments();
+          return;
+        }
+
+        editor.replaceRange(
+          buildReplyThread(match.rawHighlighted, match.entries, prepared.body, {
+            author: sanitizeAuthor(this.plugin.settings.authorName),
+            date: formatDate(new Date(), this.plugin.settings.dateFormat),
+          }),
+          startPos,
+          endPos
+        );
+        if (prepared.adjusted) {
+          new Notice(this.plugin.i18n.t("notice.commentBodyAdjusted"));
+        }
+        this.renderComments();
+      }
+    ).open();
+  }
+
+  renderEditForm(card: HTMLElement, mdView: MarkdownView, match: CommentThread) {
     const t = (key: Parameters<ReviewCommentsPlugin["i18n"]["t"]>[0]) =>
       this.plugin.i18n.t(key);
 
@@ -147,10 +186,10 @@ export class CommentsView extends ItemView {
     const textarea = form.createEl("textarea", {
       cls: "review-comment-card-textarea",
     });
-    textarea.value = match.meta.body;
+    textarea.value = match.entries[0].body;
     textarea.rows = Math.min(
       8,
-      Math.max(3, match.meta.body.split("\n").length + 1)
+      Math.max(3, match.entries[0].body.split("\n").length + 1)
     );
 
     const cancelEdit = () => {
@@ -160,6 +199,12 @@ export class CommentsView extends ItemView {
     const save = () => this.saveEdit(mdView, match, textarea.value);
 
     const actions = form.createDiv({ cls: "review-comment-card-actions" });
+    const stopDictation = attachDictationButton(
+      actions,
+      textarea,
+      this.plugin
+    );
+    this.register(() => stopDictation());
     const saveBtn = actions.createEl("button", {
       text: t("panel.save"),
       cls: "review-comment-action-btn review-comment-save-btn",
@@ -200,7 +245,7 @@ export class CommentsView extends ItemView {
     textarea.setSelectionRange(textarea.value.length, textarea.value.length);
   }
 
-  saveEdit(mdView: MarkdownView, match: CommentMatch, input: string) {
+  saveEdit(mdView: MarkdownView, match: CommentThread, input: string) {
     const prepared = prepareCommentBody(input);
     if (!prepared.body) {
       new Notice(this.plugin.i18n.t("notice.emptyCommentBody"));
@@ -218,9 +263,9 @@ export class CommentsView extends ItemView {
       return;
     }
 
-    const rebuilt = buildCommentMarkup(
+    const rebuilt = buildThreadWithNewBody(
       match.rawHighlighted,
-      match.meta,
+      match.entries,
       prepared.body,
       {
         author: sanitizeAuthor(this.plugin.settings.authorName),
@@ -237,7 +282,7 @@ export class CommentsView extends ItemView {
   }
 
   renderComments() {
-    const container = this.containerEl.children[1] as HTMLElement;
+    const container = this.contentEl;
     container.empty();
     new Setting(container)
       .setName(this.plugin.i18n.t("panel.viewTitle"))
@@ -251,21 +296,7 @@ export class CommentsView extends ItemView {
       return;
     }
 
-    const text = mdView.editor.getValue();
-    const regex = new RegExp(COMMENT_REGEX);
-    const matches: CommentMatch[] = [];
-    let m: RegExpExecArray | null;
-
-    while ((m = regex.exec(text))) {
-      matches.push({
-        highlighted: unescapeMultiline(m[1]),
-        rawHighlighted: m[1],
-        meta: parseMeta(m[2]),
-        rawMeta: m[2],
-        offset: m.index,
-        full: m[0],
-      });
-    }
+    const matches = parseThreads(mdView.editor.getValue());
 
     if (matches.length === 0) {
       container.createEl("p", {
@@ -277,13 +308,13 @@ export class CommentsView extends ItemView {
 
     matches.forEach((match) => {
       const card = container.createDiv({ cls: "review-comment-card" });
-      card.dataset.type = match.meta.type;
+      card.dataset.type = match.entries[0].type;
 
       const header = card.createDiv({ cls: "review-comment-card-header" });
       const icon = header.createSpan({ cls: "review-comment-card-icon" });
-      icon.textContent = TYPE_ICON[match.meta.type] || "💬";
+      icon.textContent = TYPE_ICON[match.entries[0].type] || "💬";
       const meta = header.createSpan({ cls: "review-comment-card-meta" });
-      meta.textContent = `${match.meta.author} · ${match.meta.date}`;
+      meta.textContent = `${match.entries[0].author} · ${match.entries[0].date}`;
 
       const original = card.createDiv({ cls: "review-comment-card-original" });
       original.textContent = `"${match.highlighted}"`;
@@ -294,7 +325,17 @@ export class CommentsView extends ItemView {
       }
 
       const body = card.createDiv({ cls: "review-comment-card-body" });
-      body.textContent = match.meta.body;
+      body.textContent = match.entries[0].body;
+
+      for (const reply of match.entries.slice(1)) {
+        const item = card.createDiv({ cls: "review-comment-card-reply" });
+        item
+          .createDiv({ cls: "review-comment-card-meta" })
+          .setText(`${reply.author} · ${reply.date}`);
+        item
+          .createDiv({ cls: "review-comment-card-body" })
+          .setText(reply.body);
+      }
 
       const actions = card.createDiv({ cls: "review-comment-card-actions" });
       const jumpBtn = actions.createEl("button", {
@@ -304,6 +345,15 @@ export class CommentsView extends ItemView {
       jumpBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         this.jumpTo(mdView, match.offset, match.full.length);
+      });
+
+      const replyBtn = actions.createEl("button", {
+        text: this.plugin.i18n.t("panel.reply"),
+        cls: "review-comment-action-btn",
+      });
+      replyBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.replyToComment(mdView, match);
       });
 
       const editBtn = actions.createEl("button", {
@@ -322,7 +372,7 @@ export class CommentsView extends ItemView {
       });
       resolveBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        this.resolveComment(mdView, match);
+        void this.resolveComment(mdView, match);
       });
 
       card.addEventListener("click", () => {

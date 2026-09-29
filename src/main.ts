@@ -1,9 +1,10 @@
-import { Editor, Notice, Plugin } from "obsidian";
+import { Editor, Notice, Plugin, TAbstractFile, TFile, debounce } from "obsidian";
 import { I18n, resolveLocale } from "./i18n";
 import { TYPES, VIEW_TYPE_COMMENTS } from "./constants";
 import {
   escapeMultiline,
   formatDate,
+  newCommentId,
   prepareCommentBody,
   sanitizeAuthor,
 } from "./comment-format";
@@ -18,18 +19,24 @@ import {
   createCommentDecorationExtension,
   renderCommentsInReadingMode,
 } from "./rendering";
-import { closeAllCommentPopovers } from "./ui/comment-bubble";
 import { FloatingBar } from "./floating-bar";
+import {
+  dropNotesFor,
+  exportComments,
+  syncCommentNotes,
+  syncOneFile,
+} from "./store";
 
 export default class ReviewCommentsPlugin extends Plugin {
   settings: ReviewCommentsSettings = DEFAULT_SETTINGS;
   i18n: I18n = new I18n("en");
   // 直後に吹き出しへ変わる新規コメントの開始位置。1回だけ消費して演出を出す
   pendingPulseOffset: number | null = null;
-  private floatingBar: FloatingBar | null = null;
+  // ウィンドウごとに1本。ポップアウトウィンドウは自分の document を持つため、
+  // メインウィンドウの1本では増やした側にボタンの列が出ない
+  private readonly floatingBars = new Map<Window, FloatingBar>();
 
   async onload() {
-    console.log("[ReviewComments] onload");
     await this.loadSettings();
     this.i18n = new I18n(resolveLocale(this.settings.language));
 
@@ -52,6 +59,18 @@ export default class ReviewCommentsPlugin extends Plugin {
       callback: () => void this.activateView(),
     });
 
+    this.addCommand({
+      id: "sync-comment-notes",
+      name: this.i18n.t("command.syncCommentNotes"),
+      callback: () => void this.runSyncCommentNotes(),
+    });
+
+    this.addCommand({
+      id: "export-comments",
+      name: this.i18n.t("command.exportComments"),
+      callback: () => void this.runExportComments(),
+    });
+
     this.addRibbonIcon("message-circle", this.i18n.t("ribbon.tooltip"), () => {
       void this.activateView();
     });
@@ -67,29 +86,103 @@ export default class ReviewCommentsPlugin extends Plugin {
       renderCommentsInReadingMode(this, el, ctx)
     );
 
-    this.registerDomEvent(activeDocument, "click", (e: MouseEvent) => {
-      const target = e.target as HTMLElement | null;
-      if (!target || !target.closest(".review-comment-anchor")) {
-        closeAllCommentPopovers();
-      }
-    });
+    // 起動時に復元されたポップアウトウィンドウも拾うため、レイアウトが整うまで待つ
+    this.app.workspace.onLayoutReady(() => this.mountFloatingBars());
+    this.registerEvent(
+      this.app.workspace.on("window-open", (_leaf, win) =>
+        this.addFloatingBar(win)
+      )
+    );
+    this.registerEvent(
+      this.app.workspace.on("window-close", (_leaf, win) =>
+        this.removeFloatingBar(win)
+      )
+    );
 
-    this.floatingBar = new FloatingBar(this);
-    this.floatingBar.mount();
+    // 保存は打鍵の区切りごとに来る。落ち着いてから、溜まったファイルを順に書き直す。
+    // 1件ずつ debounce に渡すと、続けて別のファイルを保存したときに前の分が消える
+    const pending = new Set<TFile>();
+    const flush = debounce(
+      () => {
+        const files = Array.from(pending);
+        pending.clear();
+        void (async () => {
+          for (const file of files) await syncOneFile(this, file);
+        })();
+      },
+      1500,
+      true
+    );
+    const onVaultChange = (file: TAbstractFile) => {
+      if (!this.settings.autoSync) return;
+      if (!(file instanceof TFile)) return;
+      if (file.extension !== "md") return;
+      pending.add(file);
+      flush();
+    };
+    this.registerEvent(this.app.vault.on("modify", onVaultChange));
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        if (!this.settings.autoSync) return;
+        if (!(file instanceof TFile)) return;
+        if (file.extension !== "md") return;
+        // 名前を変えると、前のパスを指したコメントノートが残る
+        void dropNotesFor(this, oldPath);
+        pending.add(file);
+        flush();
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        if (!this.settings.autoSync) return;
+        void dropNotesFor(this, file.path);
+      })
+    );
 
     this.addSettingTab(new ReviewCommentsSettingTab(this.app, this));
   }
 
   onunload() {
-    console.log("[ReviewComments] onunload");
-    // コミュニティプラグインの規約でリーフは閉じない。利用者の画面構成を壊すため
-    this.floatingBar?.destroy();
-    this.floatingBar = null;
+    // コミュニティプラグインの規約でリーフは閉じない。利用者の画面構成を壊すため。
+    // バーは addChild で繋いであり、本体の unload で一緒に外れる
+    this.floatingBars.clear();
+  }
+
+  /** 開いているすべてのウィンドウにバーを1本ずつ置く */
+  private mountFloatingBars() {
+    const windows = new Set<Window>([this.app.workspace.rootSplit.win]);
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      windows.add(leaf.getContainer().win);
+    });
+    for (const win of windows) this.addFloatingBar(win);
+  }
+
+  private addFloatingBar(win: Window) {
+    if (this.floatingBars.has(win)) return;
+    const bar = new FloatingBar(this, win);
+    this.floatingBars.set(win, bar);
+    this.addChild(bar);
+  }
+
+  private removeFloatingBar(win: Window) {
+    const bar = this.floatingBars.get(win);
+    if (!bar) return;
+    this.floatingBars.delete(win);
+    this.removeChild(bar);
   }
 
   async loadSettings() {
-    const data = (await this.loadData()) as Partial<ReviewCommentsSettings> | null;
+    const data = (await this.loadData()) as
+      | (Partial<ReviewCommentsSettings> & { resolvedFile?: string })
+      | null;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
+
+    // 2.1.0 までは1つのファイルを指していた。指していた場所の親を引き継ぐ
+    if (data?.resolvedFile && !data.resolvedFolder) {
+      const parent = data.resolvedFile.split("/").slice(0, -1).join("/");
+      this.settings.resolvedFolder = parent || DEFAULT_SETTINGS.resolvedFolder;
+      await this.saveSettings();
+    }
   }
 
   async saveSettings() {
@@ -99,7 +192,7 @@ export default class ReviewCommentsPlugin extends Plugin {
   refreshLocale() {
     this.i18n.setLocale(resolveLocale(this.settings.language));
     // 既に作られた DOM には i18n の変更が届かないため、作り直す側から声をかける
-    this.floatingBar?.refreshLabels();
+    for (const bar of this.floatingBars.values()) bar.refreshLabels();
     for (const leaf of this.app.workspace.getLeavesOfType(
       VIEW_TYPE_COMMENTS
     )) {
@@ -146,7 +239,7 @@ export default class ReviewCommentsPlugin extends Plugin {
     const typeLabel = this.i18n.t(
       TYPES.find((t) => t.tag === typeTag)?.labelKey ?? "type.note"
     );
-    new CommentInputModal(this.app, this.i18n, typeLabel, (body) => {
+    new CommentInputModal(this, typeLabel, (body) => {
       const date = formatDate(new Date(), this.settings.dateFormat);
       const author = sanitizeAuthor(this.settings.authorName);
       const prepared = prepareCommentBody(
@@ -154,7 +247,9 @@ export default class ReviewCommentsPlugin extends Plugin {
       );
       const wrapped = `{==${escapeMultiline(
         selection
-      )}==}{>>${author}|${date}|${typeTag}: ${prepared.body}<<}`;
+      )}==}{>>${newCommentId()}|${author}|${date}|${typeTag}: ${
+        prepared.body
+      }<<}`;
       editor.replaceRange(wrapped, from, to);
       this.pendingPulseOffset = fromOffset;
       // 選択がハイライト全体を覆ったままだと生の記法が出続けるため、記法の
@@ -166,6 +261,29 @@ export default class ReviewCommentsPlugin extends Plugin {
         new Notice(this.i18n.t("notice.commentBodyAdjusted"));
       }
     }).open();
+  }
+
+  /** コメントノートを作り直す。件数が0なら置き場を作らずに知らせるだけ */
+  async runSyncCommentNotes() {
+    const count = await syncCommentNotes(this);
+    if (count === 0) {
+      new Notice(this.i18n.t("notice.nothingToSync"));
+      return;
+    }
+    new Notice(
+      this.i18n.t("notice.commentNotesSynced", { count: String(count) })
+    );
+  }
+
+  async runExportComments() {
+    const { count, path } = await exportComments(this);
+    if (count === 0) {
+      new Notice(this.i18n.t("notice.nothingToSync"));
+      return;
+    }
+    new Notice(
+      this.i18n.t("notice.commentsExported", { count: String(count), path })
+    );
   }
 
   async activateView() {
